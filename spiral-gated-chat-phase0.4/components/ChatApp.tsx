@@ -52,8 +52,27 @@ type DebugPayload = {
     surprisal: number | null;
     entropy: number | null;
     score: number | null;
+    state_source?: string;
   };
   state: number;
+  provider?: {
+    name: string;
+    model: string;
+    supports_token_logprobs: boolean;
+    state_source: string;
+    calls?: {
+      purpose: string;
+      model: string;
+      latency_ms: number;
+      usage?: {
+        input_tokens?: number | null;
+        output_tokens?: number | null;
+        total_tokens?: number | null;
+      };
+      request_id?: string | null;
+      finish_reason?: string | null;
+    }[];
+  };
   meta?: {
     meta_cap_stage: number;
     meta_cap: number | null;
@@ -63,6 +82,12 @@ type DebugPayload = {
     max_output_tokens: number;
     temperature: number;
     context_keep_msgs: number;
+  };
+  log?: {
+    saved: boolean;
+    path: string | null;
+    session_index_path?: string | null;
+    error: string | null;
   };
   notes: string[];
 };
@@ -198,14 +223,19 @@ export default function ChatApp() {
 
       {/* Debug */}
       <div style={{ flex: 0.8, display: "flex", flexDirection: "column" }}>
-        <div style={{ padding: 16, borderBottom: "1px solid #eee" }}>
-          <div style={{ fontWeight: 700 }}>state / probe</div>
-          <div style={{ fontSize: 12, color: "#666" }}>
-            state = {pretty(debug?.state ?? 0)}
-          </div>
-          <div style={{ marginTop: 8, height: 10, background: "#f0f0f0", borderRadius: 999 }}>
-            <div style={{ width: `${statePct}%`, height: 10, background: "#111", borderRadius: 999 }} />
-          </div>
+          <div style={{ padding: 16, borderBottom: "1px solid #eee" }}>
+            <div style={{ fontWeight: 700 }}>state / probe</div>
+            <div style={{ fontSize: 12, color: "#666" }}>
+              state = {pretty(debug?.state ?? 0)}
+            </div>
+            <div style={{ fontSize: 12, color: "#666", marginTop: 4 }}>
+              provider: {debug?.provider ? `${debug.provider.name} / ${debug.provider.model}` : "—"}
+              <br />
+              state source: {debug?.provider?.state_source ?? debug?.metrics.state_source ?? "—"}
+            </div>
+            <div style={{ marginTop: 8, height: 10, background: "#f0f0f0", borderRadius: 999 }}>
+              <div style={{ width: `${statePct}%`, height: 10, background: "#111", borderRadius: 999 }} />
+            </div>
         </div>
 
         <div style={{ flex: 1, overflow: "auto", padding: 16 }}>
@@ -247,6 +277,20 @@ export default function ChatApp() {
                 pulse: {debug?.pulse?.triggered ? "ON" : "off"}
               </div>
               <div style={{ fontSize: 12, color: "#666", marginTop: 4 }}>
+                log:{" "}
+                {debug?.log
+                  ? debug.log.saved
+                    ? `saved → ${debug.log.path}`
+                    : `failed${debug.log.error ? `: ${debug.log.error}` : ""}`
+                  : "—"}
+                {debug?.log?.session_index_path ? (
+                  <>
+                    <br />
+                    index: {debug.log.session_index_path}
+                  </>
+                ) : null}
+              </div>
+              <div style={{ fontSize: 12, color: "#666", marginTop: 4 }}>
                 META cap: stage {debug?.meta?.meta_cap_stage ?? "—"} /{" "}
                 {debug?.meta
                   ? debug.meta.meta_cap === null
@@ -268,6 +312,8 @@ export default function ChatApp() {
               entropy: {pretty(debug?.metrics.entropy)}
               <br />
               score: {pretty(debug?.metrics.score)}
+              <br />
+              source: {debug?.metrics.state_source ?? "—"}
             </div>
           </div>
 
@@ -281,6 +327,22 @@ export default function ChatApp() {
               context_keep_msgs: {debug?.params.context_keep_msgs ?? "—"}
             </div>
           </div>
+
+          {debug?.provider?.calls?.length ? (
+            <div style={{ marginTop: 12, border: "1px solid #eee", borderRadius: 12, padding: 12 }}>
+              <div style={{ fontSize: 12, color: "#666" }}>provider calls</div>
+              <ul style={{ margin: "6px 0 0 18px", padding: 0, fontSize: 12 }}>
+                {debug.provider.calls.map((call, i) => (
+                  <li key={`${call.purpose}-${i}`}>
+                    {call.purpose}: {call.latency_ms}ms
+                    {call.usage?.total_tokens !== null && call.usage?.total_tokens !== undefined
+                      ? ` / ${call.usage.total_tokens} tok`
+                      : ""}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
 
           {debug?.summary_used || debug?.summary_stored ? (
             <div style={{ marginTop: 12, border: "1px solid #eee", borderRadius: 12, padding: 12 }}>
