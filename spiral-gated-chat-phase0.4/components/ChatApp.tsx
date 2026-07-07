@@ -86,6 +86,7 @@ type DebugPayload = {
   log?: {
     saved: boolean;
     path: string | null;
+    session_index_path?: string | null;
     error: string | null;
   };
   notes: string[];
@@ -282,6 +283,12 @@ export default function ChatApp() {
                     ? `saved → ${debug.log.path}`
                     : `failed${debug.log.error ? `: ${debug.log.error}` : ""}`
                   : "—"}
+                {debug?.log?.session_index_path ? (
+                  <>
+                    <br />
+                    index: {debug.log.session_index_path}
+                  </>
+                ) : null}
               </div>
               <div style={{ fontSize: 12, color: "#666", marginTop: 4 }}>
                 META cap: stage {debug?.meta?.meta_cap_stage ?? "—"} /{" "}

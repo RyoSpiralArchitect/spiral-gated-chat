@@ -1,4 +1,4 @@
-import { appendFile, mkdir } from "node:fs/promises";
+import { access, appendFile, mkdir } from "node:fs/promises";
 import path from "node:path";
 import type { ProviderCallRecord, ProviderName, StateSource } from "@/lib/providers/types";
 
@@ -18,6 +18,8 @@ export type TurnLogPayload = {
 export type TurnLogResult = {
   filePath: string;
   relativePath: string;
+  sessionIndexPath: string;
+  sessionIndexRelativePath: string;
 };
 
 function safeSessionId(sessionId: string): string {
@@ -30,11 +32,24 @@ function logDirectory(): string {
   return path.isAbsolute(configured) ? configured : path.join(process.cwd(), configured);
 }
 
+async function fileExists(filePath: string): Promise<boolean> {
+  try {
+    await access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export async function appendTurnLog(payload: TurnLogPayload): Promise<TurnLogResult> {
   const dir = logDirectory();
-  await mkdir(dir, { recursive: true });
+  const sessionsDir = path.join(dir, "sessions");
+  await mkdir(sessionsDir, { recursive: true });
 
-  const filePath = path.join(dir, `${safeSessionId(payload.sessionId)}.jsonl`);
+  const safeId = safeSessionId(payload.sessionId);
+  const filePath = path.join(sessionsDir, `${safeId}.jsonl`);
+  const sessionIndexPath = path.join(dir, "session-index.jsonl");
+  const isNewSessionLog = !(await fileExists(filePath));
   const entry = {
     schema_version: "spiral-gated-chat.turn.v1",
     ts: new Date().toISOString(),
@@ -50,10 +65,29 @@ export async function appendTurnLog(payload: TurnLogPayload): Promise<TurnLogRes
     debug: payload.debug,
   };
 
+  if (isNewSessionLog) {
+    await appendFile(
+      sessionIndexPath,
+      `${JSON.stringify({
+        schema_version: "spiral-gated-chat.session.v1",
+        ts: entry.ts,
+        sessionId: payload.sessionId,
+        safe_session_id: safeId,
+        provider: payload.provider,
+        model: payload.model,
+        first_turn: payload.turn,
+        log_path: path.relative(process.cwd(), filePath) || filePath,
+      })}\n`,
+      "utf8"
+    );
+  }
+
   await appendFile(filePath, `${JSON.stringify(entry)}\n`, "utf8");
 
   return {
     filePath,
     relativePath: path.relative(process.cwd(), filePath) || filePath,
+    sessionIndexPath,
+    sessionIndexRelativePath: path.relative(process.cwd(), sessionIndexPath) || sessionIndexPath,
   };
 }

@@ -691,6 +691,7 @@ export async function POST(req: Request) {
       log: {
         saved: false,
         path: null as string | null,
+        session_index_path: null as string | null,
         error: null as string | null,
       },
       notes,
@@ -709,10 +710,15 @@ export async function POST(req: Request) {
         assistantText,
         debug: { ...debug, log: undefined },
       });
-      debug.log = { saved: true, path: log.relativePath, error: null };
+      debug.log = {
+        saved: true,
+        path: log.relativePath,
+        session_index_path: log.sessionIndexRelativePath,
+        error: null,
+      };
     } catch (e: any) {
       const message = String(e?.message ?? e);
-      debug.log = { saved: false, path: null, error: message };
+      debug.log = { saved: false, path: null, session_index_path: null, error: message };
       notes.push(`log save failed: ${message}`);
     }
 

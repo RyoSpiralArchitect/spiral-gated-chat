@@ -41,7 +41,8 @@ npm run dev
 
 - ブラウザ: http://localhost:3000
 - 送信: ボタン or Ctrl/Cmd+Enter
-- 各ターンの会話・debug payload は `logs/<sessionId>.jsonl` に自動保存されます。
+- 各ターンの会話・debug payload は `logs/sessions/<sessionId>.jsonl` に自動保存されます。
+  - 新しい session は `logs/session-index.jsonl` にも 1 行追加されます。
   - 保存先は `SPIRAL_CHAT_LOG_DIR=/path/to/logs` で変更できます。
 
 ## Provider

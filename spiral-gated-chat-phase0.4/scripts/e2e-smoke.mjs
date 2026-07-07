@@ -72,13 +72,17 @@ try {
   assert(body.debug?.provider?.state_source, "state source missing");
   assert(body.debug?.log?.saved === true, "turn log was not saved");
 
-  const logPath = path.join(logDir, `${sessionId}.jsonl`);
+  const logPath = path.join(logDir, "sessions", `${sessionId}.jsonl`);
   const line = (await readFile(logPath, "utf8")).trim();
   const entry = JSON.parse(line);
   assert(entry.schema_version === "spiral-gated-chat.turn.v1", "unexpected log schema version");
   assert(entry.provider === body.debug.provider.name, "log provider mismatch");
   assert(entry.state_source === body.debug.provider.state_source, "log state source mismatch");
   assert(Array.isArray(entry.calls) && entry.calls.length >= 2, "provider calls missing from log");
+
+  const indexPath = path.join(logDir, "session-index.jsonl");
+  const sessionIndex = (await readFile(indexPath, "utf8")).trim().split("\n").map((row) => JSON.parse(row));
+  assert(sessionIndex.some((row) => row.sessionId === sessionId && row.log_path.endsWith(`${sessionId}.jsonl`)), "session index missing session");
 
   console.log(
     JSON.stringify(
@@ -88,6 +92,7 @@ try {
         provider: body.debug.provider.name,
         state_source: body.debug.provider.state_source,
         log: logPath,
+        session_index: indexPath,
       },
       null,
       2
