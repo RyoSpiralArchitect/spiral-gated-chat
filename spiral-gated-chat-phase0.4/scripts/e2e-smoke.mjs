@@ -99,6 +99,7 @@ async function step(sessionId, userText, mode = "auto", extra = {}) {
   assert.equal(body.debug.provider.name, "mock");
   assert.equal(body.debug.provider.state_source, "heuristic_probe_fields");
   assert.equal(body.debug.log.saved, true);
+  assert.equal(path.dirname(path.resolve(root, body.debug.log.path)), path.join(currentLogDir, "sessions"));
   assertAccounting(body.debug.accounting, body.debug.provider.calls);
   const memory = body.debug.memory;
   assert.ok(Array.isArray(memory.context_used));
@@ -126,8 +127,17 @@ function assertAccounting(accounting, calls) {
   assert.ok(accounting.turn_latency_ms >= accounting.provider_latency_ms);
 }
 
+async function sessionIndex() {
+  const data = await readFile(path.join(currentLogDir, "session-index.jsonl"), "utf8");
+  return data.trim().split("\n").map((line) => JSON.parse(line));
+}
+
 async function entries(sessionId) {
-  const data = await readFile(path.join(currentLogDir, "sessions", `${sessionId}.jsonl`), "utf8");
+  const matches = (await sessionIndex()).filter((entry) => entry.sessionId === sessionId);
+  assert.equal(matches.length, 1, `expected one index entry for ${sessionId}`);
+  const filePath = path.resolve(root, matches[0].log_path);
+  assert.equal(path.dirname(filePath), path.join(currentLogDir, "sessions"));
+  const data = await readFile(filePath, "utf8");
   return data.trim().split("\n").map((line) => JSON.parse(line));
 }
 
@@ -276,10 +286,11 @@ async function mainSuite() {
   assert.deepEqual(failureLog.map(({ turn, status }) => ({ turn, status })), [{ turn: 1, status: "ok" }, { turn: 2, status: "error" }, { turn: 2, status: "ok" }]);
   assert.equal(failureLog[1].assistantText, "");
   assert.equal(failureLog[1].accounting.failed_calls, 1);
-  const index = (await readFile(path.join(currentLogDir, "session-index.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+  const index = await sessionIndex();
   assert.equal(index.filter((entry) => entry.sessionId === "rollback").length, 1);
   assert.equal(index.filter((entry) => entry.sessionId === "pair-auto").length, 1);
-  assert.ok(index.every((entry) => entry.log_path.endsWith(`${entry.sessionId}.jsonl`)));
+  assert.ok(index.every((entry) => path.basename(entry.log_path) === `${entry.safe_session_id}.jsonl`));
+  assert.equal(index.find((entry) => entry.sessionId === "pair-auto").log_path, auto[0].debug.log.path);
   results.push("Main failure recorded + unknown usage + atomic rollback + retry uses same turn number");
   const repeatPreset = scenarios.find((scenario) => scenario.id === "repeated-perspective");
   assert.equal(repeatPreset.turns.length, 10);

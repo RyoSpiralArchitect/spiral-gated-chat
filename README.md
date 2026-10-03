@@ -81,7 +81,7 @@ Mock の tokens は文字数からの概算で、実際の tokenizer 使用量�
 
 ## ログと session
 
-- 会話と debug payload は `logs/sessions/<sessionId>.jsonl` に保存します
+- 会話と debug payload は `logs/sessions/<安全化した先頭80文字>-<元のsessionIdのSHA-256全長>.jsonl` に保存します。元の ID はログと index に保持し、保存先は debug の `log.path` または index の `log_path` で確認できます。旧形式のログは履歴として残し、移行しません
 - `logs/session-index.jsonl` に session の provider / model / mode と保存先を記録します
 - `SPIRAL_CHAT_LOG_DIR=/path/to/logs` で保存先を変更できます
 - ターンの schema は `spiral-gated-chat.turn.v2`。`mode`、`comparison_id`、`scenario_id`、`status`、全 calls と accounting を含みます

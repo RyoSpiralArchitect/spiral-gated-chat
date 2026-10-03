@@ -280,16 +280,14 @@ export async function POST(req: Request) {
     const parsed = stepSchema.safeParse(json);
     if (!parsed.success) return Response.json({ error: "Invalid sessionId, userText, or comparison settings" }, { status: 400 });
     const { sessionId, userText, mode, comparisonId, scenarioId, expectedTurn } = parsed.data;
-    const acquisition = acquireSession(sessionId);
+    const acquisition = acquireSession(sessionId, expectedTurn);
     if (acquisition !== "acquired") return Response.json({
-      error: acquisition === "busy" ? "This session already has a turn in progress" : "All session slots are busy; try again shortly",
-    }, { status: acquisition === "busy" ? 409 : 503 });
+      error: acquisition === "stale" ? "Session turn mismatch; start a new session after an interrupted request"
+        : acquisition === "busy" ? "This session already has a turn in progress" : "All session slots are busy; try again shortly",
+    }, { status: acquisition === "full" ? 503 : 409 });
     lockedSessionId = sessionId;
     const stored = getSession(sessionId, mode);
     if (stored.mode !== mode) return Response.json({ error: "Start a new session to change mode" }, { status: 409 });
-    if (expectedTurn !== undefined && expectedTurn !== stored.turn + 1) {
-      return Response.json({ error: "Session turn mismatch; start a new session after an interrupted request" }, { status: 409 });
-    }
     const sess = structuredClone(stored);
     sess.turn += 1;
     const turn = sess.turn;

@@ -282,3 +282,57 @@ test("the default capacity is 100 and the default idle TTL is 30 minutes", () =>
   setTime(2 * 30 * 60 * 1_000 - 1);
   assert.equal(acquire(store, "session-0").turn, 0);
 });
+
+test("rejected unknown continuations cannot evict or reserve sessions in a full store", () => {
+  const { store } = fixture({ maxSessions: 2 });
+  const first = completeTurn(store, "first");
+  const second = completeTurn(store, "second");
+  for (let i = 0; i < 20; i += 1) {
+    assert.equal(store.acquireSession(`stale-${i}`, 2), "stale");
+    assert.throws(() => store.getSession(`stale-${i}`), /Acquire/);
+  }
+  assert.equal(store.acquireSession("first", 2), "acquired");
+  assert.strictEqual(store.getSession("first"), first);
+  assert.equal(store.acquireSession("second", 2), "acquired");
+  assert.strictEqual(store.getSession("second"), second);
+  store.releaseSession("first");
+  store.releaseSession("second");
+});
+
+test("expired-session retries leave newer conversations intact after their slot was reused", () => {
+  const { store, setTime } = fixture({ maxSessions: 2, idleTtlMs: 100 });
+  completeTurn(store, "expired");
+  setTime(70);
+  const newer = completeTurn(store, "newer");
+  setTime(110);
+  const replacement = completeTurn(store, "replacement");
+  assert.equal(store.acquireSession("expired", 2), "stale");
+  assert.equal(store.acquireSession("newer", 2), "acquired");
+  assert.strictEqual(store.getSession("newer"), newer);
+  assert.equal(store.acquireSession("replacement", 2), "acquired");
+  assert.strictEqual(store.getSession("replacement"), replacement);
+});
+
+test("stale requests do not refresh LRU order but legitimate first turns may evict", () => {
+  const { store } = fixture({ maxSessions: 2 });
+  completeTurn(store, "oldest");
+  const recent = completeTurn(store, "recent");
+  assert.equal(store.acquireSession("oldest", 1), "stale");
+  assert.equal(store.acquireSession("new", 1), "acquired");
+  assert.equal(store.getSession("new").turn, 0);
+  store.releaseSession("new");
+  assert.equal(store.acquireSession("oldest", 2), "stale");
+  assert.equal(store.acquireSession("recent", 2), "acquired");
+  assert.strictEqual(store.getSession("recent"), recent);
+});
+
+test("turn validation occurs before full-capacity admission without disturbing active work", () => {
+  const { store } = fixture({ maxSessions: 1 });
+  const active = acquire(store, "active");
+  assert.equal(store.acquireSession("active", 9), "busy");
+  assert.equal(store.acquireSession("unknown", 2), "stale");
+  assert.equal(store.acquireSession("new", 1), "full");
+  assert.strictEqual(store.getSession("active"), active);
+  store.releaseSession("active");
+  assert.equal(store.acquireSession("new", 1), "acquired");
+});

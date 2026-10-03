@@ -42,9 +42,13 @@ export function createSessionStore({
     }
   }
 
-  function acquireSession(id: string): "acquired" | "busy" | "full" {
+  function acquireSession(id: string, expectedTurn?: number): "acquired" | "busy" | "full" | "stale" {
     pruneExpired();
     if (inFlight.has(id)) return "busy";
+    // Reject unknown/expired/stale continuations before reserving a slot or
+    // evicting another conversation. The lock below makes this check atomic.
+    const nextTurn = (sessions.get(id)?.session.turn ?? 0) + 1;
+    if (expectedTurn !== undefined && expectedTurn !== nextTurn) return "stale";
     // Include reservations not materialized by getSession yet, so the cap also
     // holds between acquiring a slot and creating its session.
     const reserved = [...inFlight].filter((key) => !sessions.has(key)).length;

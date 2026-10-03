@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { access, appendFile, mkdir } from "node:fs/promises";
 import path from "node:path";
 import type { TurnAccounting } from "@/lib/accounting";
@@ -29,8 +30,11 @@ export type TurnLogResult = {
 };
 
 function safeSessionId(sessionId: string): string {
-  const safe = sessionId.replace(/[^a-zA-Z0-9_.-]/g, "_").slice(0, 80);
-  return safe || "session";
+  const prefix = sessionId.replace(/[^a-zA-Z0-9_.-]/g, "_").slice(0, 80) || "session";
+  // Sanitizing/truncating is only for readability; hash every original ID so
+  // distinct IDs cannot share a log merely because their readable prefixes do.
+  const digest = createHash("sha256").update(sessionId).digest("hex");
+  return `${prefix}-${digest}`;
 }
 
 function logDirectory(): string {
