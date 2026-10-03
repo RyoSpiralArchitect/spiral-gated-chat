@@ -1,4 +1,3 @@
-import OpenAI from "openai";
 import {
   approxEntropy,
   hysteresisUpdate,
@@ -8,8 +7,10 @@ import {
   sliceFirstLine,
   updateStagnationBuffers,
 } from "@/lib/gating";
-import { getSession } from "@/lib/sessionStore";
-import type { AttentionLogEntry, GateState, TokenLogprob } from "@/lib/types";
+import { acquireSession, commitSession, getSession, releaseSession } from "@/lib/sessionStore";
+import { summarizeCalls } from "@/lib/accounting";
+import { z } from "zod";
+import type { AttentionLogEntry, GateState } from "@/lib/types";
 import {
   explorationSystemPrompt,
   frameSystemPrompt,
@@ -18,6 +19,16 @@ import {
   summaryUpdateSystemPrompt,
   verifyPickSystemPrompt,
 } from "@/lib/prompts";
+import { appendTurnLog } from "@/lib/logStore";
+import { getProvider } from "@/lib/providers";
+import type {
+  LlmProvider,
+  ProviderCallRecord,
+  ProviderTextPurpose,
+  ProviderTextRequest,
+  ProviderTextResponse,
+  StateSource,
+} from "@/lib/providers";
 
 import {
   decayFragments,
@@ -33,8 +44,6 @@ import {
 
 export const runtime = "nodejs";
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-
 function lerp(a: number, b: number, t: number): number {
   return a + (b - a) * t;
 }
@@ -45,25 +54,6 @@ function clamp(a: number, b: number, x: number): number {
 
 function clamp01(x: number): number {
   return clamp(0, 1, x);
-}
-
-function normalizeTokenLogprobs(raw: any): TokenLogprob[] {
-  if (!raw) return [];
-  if (Array.isArray(raw)) return raw as TokenLogprob[];
-  // common shapes
-  if (Array.isArray(raw.content)) return raw.content as TokenLogprob[];
-  if (Array.isArray(raw.tokens)) return raw.tokens as TokenLogprob[];
-  return [];
-}
-
-function extractFirstTextAndLogprobs(response: any): { text: string; logprobs: TokenLogprob[] } {
-  const msg = Array.isArray(response?.output)
-    ? response.output.find((o: any) => o?.type === "message" && o?.role === "assistant")
-    : null;
-  const part = msg?.content?.find((c: any) => c?.type === "output_text") ?? msg?.content?.[0];
-  const text: string = part?.text ?? "";
-  const logprobs = normalizeTokenLogprobs(part?.logprobs);
-  return { text, logprobs };
 }
 
 type ProbeFields = {
@@ -209,8 +199,35 @@ function formatAttnLog(attn: AttentionLogEntry[], maxItems = 8): string {
   ].join("\n");
 }
 
+function heuristicStateFromProbe(args: {
+  probe: ProbeFields;
+  userText: string;
+  previousState: number;
+}): number {
+  const baseByDim: Record<string, number> = {
+    RISK: 0.56,
+    UNCERTAINTY: 0.48,
+    NOVELTY: 0.46,
+    OPPORTUNITY: 0.44,
+    GOAL: 0.42,
+    META: 0.34,
+  };
+  let state = args.probe.dim ? baseByDim[args.probe.dim] ?? args.previousState : args.previousState;
+  const text = args.userText;
+  if (text.length > 160) state += 0.06;
+  if (/[?？]/.test(text)) state += 0.03;
+  if (/死|危険|壊|risk|ログ|log/i.test(text)) state += 0.05;
+  if (args.probe.focus && args.probe.next) state += 0.02;
+  return clamp01(state);
+}
+
+type RunProviderText = (
+  purpose: ProviderTextPurpose,
+  request: Omit<ProviderTextRequest, "purpose" | "model">
+) => Promise<ProviderTextResponse>;
+
 async function updateOneLineSummary(args: {
-  model: string;
+  runText: RunProviderText;
   prevSummary: string;
   userText: string;
   assistantText: string;
@@ -227,8 +244,7 @@ async function updateOneLineSummary(args: {
     "Write the updated one-line summary:",
   ].join("\n");
 
-  const resp = await openai.responses.create({
-    model: args.model,
+  const resp = await args.runText("summary", {
     input: [
       { role: "system", content: summaryUpdateSystemPrompt() },
       { role: "user", content },
@@ -237,27 +253,66 @@ async function updateOneLineSummary(args: {
     max_output_tokens: clamp(20, 120, Math.round(args.maxTokens)),
   });
 
-  const { text } = extractFirstTextAndLogprobs(resp);
-  const one = safeOneLine(text);
+  const one = safeOneLine(resp.text);
   if (!one) return null;
   // hard cap (safety belt)
   return one.length > 160 ? one.slice(0, 160) : one;
 }
 
+const stepSchema = z.object({
+  sessionId: z.string().regex(/^[a-zA-Z0-9_-]{1,80}$/),
+  userText: z.string().trim().min(1).max(12000),
+  mode: z.enum(["auto", "fixed"]).default("auto"),
+  expectedTurn: z.number().int().positive().max(100000).optional(),
+  comparisonId: z.string().regex(/^[a-zA-Z0-9_-]{1,80}$/).optional(),
+  scenarioId: z.string().regex(/^[a-zA-Z0-9_-]{1,80}$/).optional(),
+});
+
 export async function POST(req: Request) {
+  const startedAt = Date.now();
+  const providerCalls: ProviderCallRecord[] = [];
+  let lockedSessionId: string | null = null;
+  let provider: LlmProvider | null = null;
+  let stateSource: StateSource = "previous_state";
+  let attempted: { sessionId: string; userText: string; mode: "auto" | "fixed"; comparisonId?: string; scenarioId?: string; turn: number } | null = null;
   try {
-    const body = (await req.json()) as { sessionId: string; userText: string };
-    const sessionId = body?.sessionId;
-    const userText = (body?.userText ?? "").toString();
-    if (!sessionId || !userText.trim()) {
-      return new Response(JSON.stringify({ error: "Missing sessionId or userText" }), { status: 400 });
-    }
-
-    const model = process.env.OPENAI_MODEL || "gpt-4.1";
-
-    const sess = getSession(sessionId);
+    let json: unknown;
+    try { json = await req.json(); } catch { return Response.json({ error: "Invalid JSON body" }, { status: 400 }); }
+    const parsed = stepSchema.safeParse(json);
+    if (!parsed.success) return Response.json({ error: "Invalid sessionId, userText, or comparison settings" }, { status: 400 });
+    const { sessionId, userText, mode, comparisonId, scenarioId, expectedTurn } = parsed.data;
+    const acquisition = acquireSession(sessionId, expectedTurn);
+    if (acquisition !== "acquired") return Response.json({
+      error: acquisition === "stale" ? "Session turn mismatch; start a new session after an interrupted request"
+        : acquisition === "busy" ? "This session already has a turn in progress" : "All session slots are busy; try again shortly",
+    }, { status: acquisition === "full" ? 503 : 409 });
+    lockedSessionId = sessionId;
+    const stored = getSession(sessionId, mode);
+    if (stored.mode !== mode) return Response.json({ error: "Start a new session to change mode" }, { status: 409 });
+    const sess = structuredClone(stored);
     sess.turn += 1;
     const turn = sess.turn;
+    attempted = { ...parsed.data, turn };
+    provider = getProvider();
+    const activeProvider = provider;
+    const model = activeProvider.model;
+    const runText: RunProviderText = async (purpose, request) => {
+      const callStartedAt = Date.now();
+      try {
+        const response = await activeProvider.createText({ ...request, purpose, model });
+        providerCalls.push({
+          purpose, status: "ok", provider: activeProvider.name, model: response.model,
+          latency_ms: Date.now() - callStartedAt, usage: response.usage,
+          request_id: response.requestId, finish_reason: response.finishReason,
+        });
+        return response;
+      } catch (error) {
+        providerCalls.push({ purpose, status: "error", provider: activeProvider.name, model, latency_ms: Date.now() - callStartedAt });
+        throw error;
+      }
+    };
+    const previousDim = sess.gate.last_dims.at(-1) ?? null;
+    const previousFocus = sess.gate.last_focus.at(-1) ?? null;
 
     // append user message to history
     sess.history.push({ role: "user", content: userText });
@@ -265,20 +320,19 @@ export async function POST(req: Request) {
     // ----------------
     // Phase A: PROBE (same model)
     // ----------------
-    const probeResp = await openai.responses.create({
-      model,
+    const probeResp = await runText("probe", {
       input: [
         { role: "system", content: probeSystemPrompt() },
         { role: "user", content: userText },
       ],
       temperature: 0.2,
       max_output_tokens: 90,
-      // request logprobs
-      include: ["message.output_text.logprobs"],
-      top_logprobs: 20,
+      includeLogprobs: provider.capabilities.tokenLogprobs,
+      topLogprobs: 20,
     });
 
-    const { text: probeText, logprobs: probeLogprobs } = extractFirstTextAndLogprobs(probeResp);
+    const probeText = probeResp.text;
+    const probeLogprobs = probeResp.logprobs;
     const probeFields = parseProbeFields(probeText);
     const originalProbe: ProbeFields = { raw: probeText || "", ...probeFields };
 
@@ -297,32 +351,43 @@ export async function POST(req: Request) {
 
     const ETA = 0.06; // baseline update speed
 
-    if (S !== null) {
-      zS = (S - sess.gate.S.mean) / Math.sqrt(sess.gate.S.var + 1e-8);
-      sess.gate.S.mean = (1 - ETA) * sess.gate.S.mean + ETA * S;
-      const d = S - sess.gate.S.mean;
-      sess.gate.S.var = (1 - ETA) * sess.gate.S.var + ETA * d * d;
-    } else {
-      notes.push("logprobs missing → surprisal unavailable");
-    }
+    if (provider.capabilities.tokenLogprobs) {
+      if (S !== null) {
+        zS = (S - sess.gate.S.mean) / Math.sqrt(sess.gate.S.var + 1e-8);
+        sess.gate.S.mean = (1 - ETA) * sess.gate.S.mean + ETA * S;
+        const d = S - sess.gate.S.mean;
+        sess.gate.S.var = (1 - ETA) * sess.gate.S.var + ETA * d * d;
+      } else {
+        notes.push("logprobs missing → surprisal unavailable");
+      }
 
-    if (H !== null) {
-      zH = (H - sess.gate.H.mean) / Math.sqrt(sess.gate.H.var + 1e-8);
-      sess.gate.H.mean = (1 - ETA) * sess.gate.H.mean + ETA * H;
-      const d = H - sess.gate.H.mean;
-      sess.gate.H.var = (1 - ETA) * sess.gate.H.var + ETA * d * d;
-    } else {
-      notes.push("top_logprobs missing → entropy unavailable");
-    }
+      if (H !== null) {
+        zH = (H - sess.gate.H.mean) / Math.sqrt(sess.gate.H.var + 1e-8);
+        sess.gate.H.mean = (1 - ETA) * sess.gate.H.mean + ETA * H;
+        const d = H - sess.gate.H.mean;
+        sess.gate.H.var = (1 - ETA) * sess.gate.H.var + ETA * d * d;
+      } else {
+        notes.push("top_logprobs missing → entropy unavailable");
+      }
 
-    if (zS !== null || zH !== null) {
-      const a = 0.7;
-      const b = 0.3;
-      const sPart = zS ?? 0;
-      const hPart = zH ?? 0;
-      score = a * sPart + b * hPart;
-      const tau = 1.2;
-      rawStateFromScore = 1 / (1 + Math.exp(-score / tau));
+      if (zS !== null || zH !== null) {
+        const a = 0.7;
+        const b = 0.3;
+        const sPart = zS ?? 0;
+        const hPart = zH ?? 0;
+        score = a * sPart + b * hPart;
+        const tau = 1.2;
+        rawStateFromScore = 1 / (1 + Math.exp(-score / tau));
+        stateSource = "token_logprobs";
+      }
+    } else {
+      rawStateFromScore = heuristicStateFromProbe({
+        probe: originalProbe,
+        userText,
+        previousState: sess.gate.last_state,
+      });
+      stateSource = "heuristic_probe_fields";
+      notes.push(`${provider.name} provider has no token logprobs → state uses heuristic_probe_fields`);
     }
 
     // ----------------
@@ -344,11 +409,10 @@ export async function POST(req: Request) {
       selected_probe: null,
     };
 
-    if (stagnationDetected && cooldownOk && notRiskLoop && boredomish) {
+    if (mode === "auto" && stagnationDetected && cooldownOk && notRiskLoop && boredomish) {
       try {
         // Generate 3 alternative probes (high temp, short)
-        const exploreResp = await openai.responses.create({
-          model,
+        const exploreResp = await runText("explore", {
           input: [
             { role: "system", content: explorationSystemPrompt(repeatingDim) },
             {
@@ -365,14 +429,13 @@ export async function POST(req: Request) {
           max_output_tokens: 220,
         });
 
-        const { text: candidatesText } = extractFirstTextAndLogprobs(exploreResp);
+        const candidatesText = exploreResp.text;
         pulse.candidates_text = candidatesText || null;
 
         const cands = parseCandidates(candidatesText || "");
         if (cands.length >= 2) {
           // Verify pick (temp ~0)
-          const verifyResp = await openai.responses.create({
-            model,
+          const verifyResp = await runText("verify", {
             input: [
               { role: "system", content: verifyPickSystemPrompt() },
               {
@@ -393,7 +456,7 @@ export async function POST(req: Request) {
             max_output_tokens: 20,
           });
 
-          const { text: pickText } = extractFirstTextAndLogprobs(verifyResp);
+          const pickText = verifyResp.text;
           const pick = parsePick(pickText || "") ?? 1;
           const idx = clamp(1, cands.length, pick) - 1;
           const selected = cands[idx];
@@ -417,7 +480,9 @@ export async function POST(req: Request) {
     const dimWeighted = applyDimWeight(rawStateFromScore, effectiveProbe.dim, sess.gate);
     notes.push(...dimWeighted.notes);
 
-    const state = hysteresisUpdate(sess.gate.last_state, dimWeighted.raw, 0.62, 0.48, 0.6);
+    const observedState = hysteresisUpdate(sess.gate.last_state, dimWeighted.raw, 0.62, 0.48, 0.6);
+    const state = mode === "fixed" ? 0.5 : observedState;
+    if (mode === "fixed") notes.push("Fixed baseline: state 0.50; same Probe and memory rules; exploration disabled");
     sess.gate.last_state = state;
 
     // Update stagnation buffers using the EFFECTIVE probe (so pulses actually break repetition)
@@ -535,12 +600,13 @@ export async function POST(req: Request) {
       sysParts.push({ role: "system", content: `SUMMARY: ${summaryUsed}` });
     }
 
-    if (attn_items > 0 && sess.memory.attn_log.length) {
+    const attentionUsed = attn_items > 0 ? sess.memory.attn_log.slice(-attn_items).map((entry) => ({ ...entry })) : [];
+    if (attentionUsed.length) {
       sysParts.push({ role: "system", content: formatAttnLog(sess.memory.attn_log, attn_items) });
     }
 
     // Inject salience-ranked memory fragments (can include older-but-important notes)
-    const fragPicked = pickTopFragments(sess.memory.fragments, frag_items);
+    const fragPicked = pickTopFragments(sess.memory.fragments, frag_items).map((fragment) => ({ ...fragment }));
     if (fragPicked.length) {
       sysParts.push({ role: "system", content: formatFragmentsForPrompt(fragPicked) });
       rehearseFragments(sess.memory.fragments, fragPicked, turn);
@@ -557,14 +623,13 @@ export async function POST(req: Request) {
       }),
     });
 
-    const mainResp = await openai.responses.create({
-      model,
+    const mainResp = await runText("main", {
       input: [...sysParts, ...ctx.map((m) => ({ role: m.role, content: m.content }))],
       temperature,
       max_output_tokens,
     });
 
-    const { text: assistantText } = extractFirstTextAndLogprobs(mainResp);
+    const assistantText = mainResp.text;
 
     sess.history.push({ role: "assistant", content: assistantText });
 
@@ -575,7 +640,7 @@ export async function POST(req: Request) {
     if (shouldUpdateSummary) {
       try {
         const newSummary = await updateOneLineSummary({
-          model,
+          runText,
           prevSummary: sess.memory.summary,
           userText,
           assistantText,
@@ -590,13 +655,26 @@ export async function POST(req: Request) {
       }
     }
 
+    const viewpoint = {
+      previous_dim: previousDim,
+      previous_focus: previousFocus,
+      changed: previousDim !== null && (previousDim !== effectiveProbe.dim || previousFocus !== effectiveProbe.focus),
+      pulse_changed: pulse.triggered && (originalProbe.dim !== effectiveProbe.dim || originalProbe.focus !== effectiveProbe.focus),
+    };
+    const accounting = summarizeCalls(providerCalls, Date.now() - startedAt);
     const debug = {
+      mode,
+      observed_state: observedState,
+      viewpoint,
+      accounting,
       probeText: effectiveProbe.raw || null,
       probeText_original: originalProbe.raw || null,
       dim: effectiveProbe.dim,
       focus: effectiveProbe.focus,
       next: effectiveProbe.next,
       memory: {
+        context_used: ctx.map((message) => ({ ...message })),
+        attention_used: attentionUsed,
         ctx_keep_msgs,
         summary_chars,
         attn_items,
@@ -631,8 +709,16 @@ export async function POST(req: Request) {
         surprisal: S,
         entropy: H,
         score,
+        state_source: stateSource,
       },
       state,
+      provider: {
+        name: provider.name,
+        model,
+        supports_token_logprobs: provider.capabilities.tokenLogprobs,
+        state_source: stateSource,
+        calls: providerCalls,
+      },
       meta: {
         meta_cap_stage: sess.gate.meta_cap_stage,
         meta_cap: metaCapValue(sess.gate.meta_cap_stage),
@@ -643,14 +729,62 @@ export async function POST(req: Request) {
         temperature,
         context_keep_msgs: ctx_keep_msgs,
       },
+      log: {
+        saved: false,
+        path: null as string | null,
+        session_index_path: null as string | null,
+        error: null as string | null,
+      },
       notes,
     };
 
-    return new Response(JSON.stringify({ assistantText, debug }), {
+    try {
+      const log = await appendTurnLog({
+        sessionId,
+        turn,
+        mode, comparisonId, scenarioId, accounting, status: "ok",
+        provider: provider.name,
+        model,
+        stateSource,
+        latencyMs: Date.now() - startedAt,
+        calls: providerCalls,
+        userText,
+        assistantText,
+        debug: { ...debug, log: undefined },
+      });
+      debug.log = {
+        saved: true,
+        path: log.relativePath,
+        session_index_path: log.sessionIndexRelativePath,
+        error: null,
+      };
+    } catch (e: any) {
+      const message = String(e?.message ?? e);
+      debug.log = { saved: false, path: null, session_index_path: null, error: message };
+      notes.push(`log save failed: ${message}`);
+    }
+
+    commitSession(sess);
+    return new Response(JSON.stringify({ sessionId, turn, mode, userText, assistantText, debug }), {
       status: 200,
       headers: { "Content-Type": "application/json" },
     });
-  } catch (err: any) {
-    return new Response(JSON.stringify({ error: String(err?.message ?? err) }), { status: 500 });
+  } catch (err: unknown) {
+    const error = err instanceof Error ? err.message : String(err);
+    const accounting = summarizeCalls(providerCalls, Date.now() - startedAt);
+    // Failed attempts are recorded without committing their partial conversation.
+    // Retrying therefore uses the same turn number; status distinguishes attempts.
+    if (attempted && provider) {
+      try {
+        await appendTurnLog({ ...attempted, status: "error", accounting,
+          provider: provider.name, model: provider.model, stateSource,
+          latencyMs: accounting.turn_latency_ms, calls: providerCalls,
+          assistantText: "", debug: { error, accounting },
+        });
+      } catch { /* Preserve the original failure; the response still carries usage. */ }
+    }
+    return Response.json({ error, accounting, calls: providerCalls }, { status: 500 });
+  } finally {
+    if (lockedSessionId) releaseSession(lockedSessionId);
   }
 }
