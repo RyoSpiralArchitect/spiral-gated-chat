@@ -51,7 +51,9 @@ async function createResponse(openai: OpenAI, params: ResponseCreateParamsWithLo
 }
 
 export function createOpenAIProvider(): LlmProvider {
-  const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+  // Keep each recorded call to one HTTP attempt. Hidden SDK retries can incur
+  // unknown usage and would make a successful total look falsely complete.
+  const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY, maxRetries: 0 });
   const defaultModel = process.env.OPENAI_MODEL || "gpt-4.1";
 
   return {

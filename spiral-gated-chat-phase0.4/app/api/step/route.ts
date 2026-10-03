@@ -7,7 +7,9 @@ import {
   sliceFirstLine,
   updateStagnationBuffers,
 } from "@/lib/gating";
-import { getSession } from "@/lib/sessionStore";
+import { acquireSession, commitSession, getSession, releaseSession } from "@/lib/sessionStore";
+import { summarizeCalls } from "@/lib/accounting";
+import { z } from "zod";
 import type { AttentionLogEntry, GateState } from "@/lib/types";
 import {
   explorationSystemPrompt,
@@ -20,6 +22,7 @@ import {
 import { appendTurnLog } from "@/lib/logStore";
 import { getProvider } from "@/lib/providers";
 import type {
+  LlmProvider,
   ProviderCallRecord,
   ProviderTextPurpose,
   ProviderTextRequest,
@@ -256,37 +259,59 @@ async function updateOneLineSummary(args: {
   return one.length > 160 ? one.slice(0, 160) : one;
 }
 
+const stepSchema = z.object({
+  sessionId: z.string().regex(/^[a-zA-Z0-9_-]{1,80}$/),
+  userText: z.string().trim().min(1).max(12000),
+  mode: z.enum(["auto", "fixed"]).default("auto"),
+  expectedTurn: z.number().int().positive().max(100000).optional(),
+  comparisonId: z.string().regex(/^[a-zA-Z0-9_-]{1,80}$/).optional(),
+  scenarioId: z.string().regex(/^[a-zA-Z0-9_-]{1,80}$/).optional(),
+});
+
 export async function POST(req: Request) {
+  const startedAt = Date.now();
+  const providerCalls: ProviderCallRecord[] = [];
+  let lockedSessionId: string | null = null;
+  let provider: LlmProvider | null = null;
+  let attempted: { sessionId: string; userText: string; mode: "auto" | "fixed"; comparisonId?: string; scenarioId?: string; turn: number } | null = null;
   try {
-    const startedAt = Date.now();
-    const body = (await req.json()) as { sessionId: string; userText: string };
-    const sessionId = body?.sessionId;
-    const userText = (body?.userText ?? "").toString();
-    if (!sessionId || !userText.trim()) {
-      return new Response(JSON.stringify({ error: "Missing sessionId or userText" }), { status: 400 });
-    }
-
-    const provider = getProvider();
-    const model = provider.model;
-    const providerCalls: ProviderCallRecord[] = [];
-    const runText: RunProviderText = async (purpose, request) => {
-      const callStartedAt = Date.now();
-      const response = await provider.createText({ ...request, purpose, model });
-      providerCalls.push({
-        purpose,
-        provider: provider.name,
-        model: response.model,
-        latency_ms: Date.now() - callStartedAt,
-        usage: response.usage,
-        request_id: response.requestId,
-        finish_reason: response.finishReason,
-      });
-      return response;
-    };
-
-    const sess = getSession(sessionId);
+    let json: unknown;
+    try { json = await req.json(); } catch { return Response.json({ error: "Invalid JSON body" }, { status: 400 }); }
+    const parsed = stepSchema.safeParse(json);
+    if (!parsed.success) return Response.json({ error: "Invalid sessionId, userText, or comparison settings" }, { status: 400 });
+    const { sessionId, userText, mode, comparisonId, scenarioId, expectedTurn } = parsed.data;
+    const acquisition = acquireSession(sessionId, expectedTurn);
+    if (acquisition !== "acquired") return Response.json({
+      error: acquisition === "stale" ? "Session turn mismatch; start a new session after an interrupted request"
+        : acquisition === "busy" ? "This session already has a turn in progress" : "All session slots are busy; try again shortly",
+    }, { status: acquisition === "full" ? 503 : 409 });
+    lockedSessionId = sessionId;
+    const stored = getSession(sessionId, mode);
+    if (stored.mode !== mode) return Response.json({ error: "Start a new session to change mode" }, { status: 409 });
+    const sess = structuredClone(stored);
     sess.turn += 1;
     const turn = sess.turn;
+    attempted = { ...parsed.data, turn };
+    provider = getProvider();
+    const activeProvider = provider;
+    const model = activeProvider.model;
+    const runText: RunProviderText = async (purpose, request) => {
+      const callStartedAt = Date.now();
+      try {
+        const response = await activeProvider.createText({ ...request, purpose, model });
+        providerCalls.push({
+          purpose, status: "ok", provider: activeProvider.name, model: response.model,
+          latency_ms: Date.now() - callStartedAt, usage: response.usage,
+          request_id: response.requestId, finish_reason: response.finishReason,
+        });
+        return response;
+      } catch (error) {
+        providerCalls.push({ purpose, status: "error", provider: activeProvider.name, model, latency_ms: Date.now() - callStartedAt });
+        throw error;
+      }
+    };
+    const previousDim = sess.gate.last_dims.at(-1) ?? null;
+    const previousFocus = sess.gate.last_focus.at(-1) ?? null;
 
     // append user message to history
     sess.history.push({ role: "user", content: userText });
@@ -384,7 +409,7 @@ export async function POST(req: Request) {
       selected_probe: null,
     };
 
-    if (stagnationDetected && cooldownOk && notRiskLoop && boredomish) {
+    if (mode === "auto" && stagnationDetected && cooldownOk && notRiskLoop && boredomish) {
       try {
         // Generate 3 alternative probes (high temp, short)
         const exploreResp = await runText("explore", {
@@ -455,7 +480,9 @@ export async function POST(req: Request) {
     const dimWeighted = applyDimWeight(rawStateFromScore, effectiveProbe.dim, sess.gate);
     notes.push(...dimWeighted.notes);
 
-    const state = hysteresisUpdate(sess.gate.last_state, dimWeighted.raw, 0.62, 0.48, 0.6);
+    const observedState = hysteresisUpdate(sess.gate.last_state, dimWeighted.raw, 0.62, 0.48, 0.6);
+    const state = mode === "fixed" ? 0.5 : observedState;
+    if (mode === "fixed") notes.push("Fixed baseline: state 0.50; same Probe and memory rules; exploration disabled");
     sess.gate.last_state = state;
 
     // Update stagnation buffers using the EFFECTIVE probe (so pulses actually break repetition)
@@ -573,12 +600,13 @@ export async function POST(req: Request) {
       sysParts.push({ role: "system", content: `SUMMARY: ${summaryUsed}` });
     }
 
-    if (attn_items > 0 && sess.memory.attn_log.length) {
+    const attentionUsed = attn_items > 0 ? sess.memory.attn_log.slice(-attn_items).map((entry) => ({ ...entry })) : [];
+    if (attentionUsed.length) {
       sysParts.push({ role: "system", content: formatAttnLog(sess.memory.attn_log, attn_items) });
     }
 
     // Inject salience-ranked memory fragments (can include older-but-important notes)
-    const fragPicked = pickTopFragments(sess.memory.fragments, frag_items);
+    const fragPicked = pickTopFragments(sess.memory.fragments, frag_items).map((fragment) => ({ ...fragment }));
     if (fragPicked.length) {
       sysParts.push({ role: "system", content: formatFragmentsForPrompt(fragPicked) });
       rehearseFragments(sess.memory.fragments, fragPicked, turn);
@@ -627,13 +655,26 @@ export async function POST(req: Request) {
       }
     }
 
+    const viewpoint = {
+      previous_dim: previousDim,
+      previous_focus: previousFocus,
+      changed: previousDim !== null && (previousDim !== effectiveProbe.dim || previousFocus !== effectiveProbe.focus),
+      pulse_changed: pulse.triggered && (originalProbe.dim !== effectiveProbe.dim || originalProbe.focus !== effectiveProbe.focus),
+    };
+    const accounting = summarizeCalls(providerCalls, Date.now() - startedAt);
     const debug = {
+      mode,
+      observed_state: observedState,
+      viewpoint,
+      accounting,
       probeText: effectiveProbe.raw || null,
       probeText_original: originalProbe.raw || null,
       dim: effectiveProbe.dim,
       focus: effectiveProbe.focus,
       next: effectiveProbe.next,
       memory: {
+        context_used: ctx.map((message) => ({ ...message })),
+        attention_used: attentionUsed,
         ctx_keep_msgs,
         summary_chars,
         attn_items,
@@ -701,6 +742,7 @@ export async function POST(req: Request) {
       const log = await appendTurnLog({
         sessionId,
         turn,
+        mode, comparisonId, scenarioId, accounting, status: "ok",
         provider: provider.name,
         model,
         stateSource,
@@ -722,11 +764,27 @@ export async function POST(req: Request) {
       notes.push(`log save failed: ${message}`);
     }
 
-    return new Response(JSON.stringify({ assistantText, debug }), {
+    commitSession(sess);
+    return new Response(JSON.stringify({ sessionId, turn, mode, userText, assistantText, debug }), {
       status: 200,
       headers: { "Content-Type": "application/json" },
     });
-  } catch (err: any) {
-    return new Response(JSON.stringify({ error: String(err?.message ?? err) }), { status: 500 });
+  } catch (err: unknown) {
+    const error = err instanceof Error ? err.message : String(err);
+    const accounting = summarizeCalls(providerCalls, Date.now() - startedAt);
+    // Failed attempts are recorded without committing their partial conversation.
+    // Retrying therefore uses the same turn number; status distinguishes attempts.
+    if (attempted && provider) {
+      try {
+        await appendTurnLog({ ...attempted, status: "error", accounting,
+          provider: provider.name, model: provider.model, stateSource: "previous_state",
+          latencyMs: accounting.turn_latency_ms, calls: providerCalls,
+          assistantText: "", debug: { error, accounting },
+        });
+      } catch { /* Preserve the original failure; the response still carries usage. */ }
+    }
+    return Response.json({ error, accounting, calls: providerCalls }, { status: 500 });
+  } finally {
+    if (lockedSessionId) releaseSession(lockedSessionId);
   }
 }
