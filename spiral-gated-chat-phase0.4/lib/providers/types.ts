@@ -45,6 +45,7 @@ export type LlmProvider = {
 
 export type ProviderCallRecord = {
   purpose: ProviderTextPurpose;
+  status?: "ok" | "error";
   provider: ProviderName;
   model: string;
   latency_ms: number;

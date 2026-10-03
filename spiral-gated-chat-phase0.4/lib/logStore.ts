@@ -1,10 +1,16 @@
 import { access, appendFile, mkdir } from "node:fs/promises";
 import path from "node:path";
+import type { TurnAccounting } from "@/lib/accounting";
 import type { ProviderCallRecord, ProviderName, StateSource } from "@/lib/providers/types";
 
 export type TurnLogPayload = {
   sessionId: string;
   turn: number;
+  mode: "auto" | "fixed";
+  comparisonId?: string;
+  scenarioId?: string;
+  accounting: TurnAccounting;
+  status: "ok" | "error";
   provider: ProviderName;
   model: string;
   stateSource: StateSource;
@@ -51,10 +57,15 @@ export async function appendTurnLog(payload: TurnLogPayload): Promise<TurnLogRes
   const sessionIndexPath = path.join(dir, "session-index.jsonl");
   const isNewSessionLog = !(await fileExists(filePath));
   const entry = {
-    schema_version: "spiral-gated-chat.turn.v1",
+    schema_version: "spiral-gated-chat.turn.v2",
     ts: new Date().toISOString(),
     sessionId: payload.sessionId,
     turn: payload.turn,
+    mode: payload.mode,
+    comparison_id: payload.comparisonId ?? null,
+    scenario_id: payload.scenarioId ?? null,
+    status: payload.status,
+    accounting: payload.accounting,
     provider: payload.provider,
     model: payload.model,
     state_source: payload.stateSource,
@@ -76,6 +87,9 @@ export async function appendTurnLog(payload: TurnLogPayload): Promise<TurnLogRes
         provider: payload.provider,
         model: payload.model,
         first_turn: payload.turn,
+        mode: payload.mode,
+        comparison_id: payload.comparisonId ?? null,
+        scenario_id: payload.scenarioId ?? null,
         log_path: path.relative(process.cwd(), filePath) || filePath,
       })}\n`,
       "utf8"

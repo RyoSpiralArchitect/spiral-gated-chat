@@ -10,6 +10,15 @@ function configuredProviderName(): ProviderName {
   return "openai";
 }
 
+/** Non-secret configuration; does not instantiate an SDK or require credentials. */
+export function getProviderConfig() {
+  const provider = configuredProviderName();
+  const model = provider === "mock" ? process.env.MOCK_MODEL || "mock-gated-chat"
+    : provider === "anthropic" ? process.env.ANTHROPIC_MODEL || "claude-sonnet-4-6"
+    : process.env.OPENAI_MODEL || "gpt-4.1";
+  return { provider, model, isMock: provider === "mock" };
+}
+
 export function getProvider(): LlmProvider {
   const provider = configuredProviderName();
   if (provider === "anthropic") return createAnthropicProvider();
