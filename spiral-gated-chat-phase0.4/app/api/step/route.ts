@@ -273,6 +273,7 @@ export async function POST(req: Request) {
   const providerCalls: ProviderCallRecord[] = [];
   let lockedSessionId: string | null = null;
   let provider: LlmProvider | null = null;
+  let stateSource: StateSource = "previous_state";
   let attempted: { sessionId: string; userText: string; mode: "auto" | "fixed"; comparisonId?: string; scenarioId?: string; turn: number } | null = null;
   try {
     let json: unknown;
@@ -347,7 +348,6 @@ export async function POST(req: Request) {
 
     // fallback: keep previous
     let rawStateFromScore = sess.gate.last_state;
-    let stateSource: StateSource = "previous_state";
 
     const ETA = 0.06; // baseline update speed
 
@@ -777,7 +777,7 @@ export async function POST(req: Request) {
     if (attempted && provider) {
       try {
         await appendTurnLog({ ...attempted, status: "error", accounting,
-          provider: provider.name, model: provider.model, stateSource: "previous_state",
+          provider: provider.name, model: provider.model, stateSource,
           latencyMs: accounting.turn_latency_ms, calls: providerCalls,
           assistantText: "", debug: { error, accounting },
         });

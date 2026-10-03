@@ -30,12 +30,18 @@ function acquire(store, id, mode = "auto") {
   return store.getSession(id, mode);
 }
 
-function completeTurn(store, id, mode = "auto") {
-  const next = structuredClone(acquire(store, id, mode));
+function commitAcquiredTurn(store, id) {
+  const next = structuredClone(store.getSession(id));
   next.turn += 1;
   next.history.push({ role: "user", content: `${id}: turn ${next.turn}` });
   next.history.push({ role: "assistant", content: `${id}: reply ${next.turn}` });
   store.commitSession(next);
+  return next;
+}
+
+function completeTurn(store, id, mode = "auto") {
+  acquire(store, id, mode);
+  const next = commitAcquiredTurn(store, id);
   store.releaseSession(id);
   return next;
 }
@@ -78,8 +84,10 @@ test("a second acquisition is busy before and after a session is materialized", 
   const original = store.getSession("a");
   assert.equal(store.acquireSession("a"), "busy");
   assert.strictEqual(store.getSession("a"), original);
+  const committed = commitAcquiredTurn(store, "a");
+  assert.equal(store.acquireSession("a"), "busy");
   store.releaseSession("a");
-  assert.strictEqual(acquire(store, "a"), original);
+  assert.strictEqual(acquire(store, "a"), committed);
 });
 
 test("repeated Fixed/Auto comparison-like runs evict old completed sessions and retain the newest runs", () => {
@@ -179,6 +187,7 @@ test("LRU eviction skips an older active session and only evicts an idle session
   assert.equal(store.acquireSession("active"), "busy");
   assert.equal(store.acquireSession("idle"), "full");
   assert.strictEqual(store.getSession("replacement"), replacement);
+  commitAcquiredTurn(store, "replacement");
   store.releaseSession("replacement");
   assert.equal(acquire(store, "idle").turn, 0);
   assert.strictEqual(store.getSession("active"), active);
@@ -215,9 +224,9 @@ test("unmaterialized reservations count toward the cap alongside materialized se
   assert.strictEqual(store.getSession("reserved-b"), second);
 });
 
-test("new reservations may evict idle sessions but cannot overbook the remaining reservations", () => {
+test("new reservations preserve idle sessions and cannot overbook the remaining reservations", () => {
   const { store } = fixture({ maxSessions: 2 });
-  completeTurn(store, "old-idle");
+  const oldIdle = completeTurn(store, "old-idle");
   assert.equal(store.acquireSession("reserved-a"), "acquired");
   assert.equal(store.acquireSession("reserved-b"), "acquired");
   assert.equal(store.acquireSession("reserved-c"), "full");
@@ -226,7 +235,7 @@ test("new reservations may evict idle sessions but cannot overbook the remaining
   store.getSession("reserved-b");
   assert.equal(store.acquireSession("reserved-c"), "full");
   store.releaseSession("reserved-b");
-  assert.equal(acquire(store, "old-idle").turn, 0);
+  assert.strictEqual(acquire(store, "old-idle"), oldIdle);
   assert.strictEqual(store.getSession("reserved-a"), first);
 });
 
@@ -268,6 +277,143 @@ test("a failed turn's modified snapshot leaves the committed session unchanged a
   assert.equal(retry.turn, failedAttempt.turn);
   assert.equal(retry.history.length, 4);
   assert.deepEqual(committed, beforeAttempt);
+});
+
+test("a failed first turn leaves no empty session or pinned mode and the same ID can retry", () => {
+  const { store } = fixture({ maxSessions: 1 });
+  const initial = acquire(store, "retry", "fixed");
+  const failedAttempt = structuredClone(initial);
+  failedAttempt.turn += 1;
+  failedAttempt.gate.S.mean = 99;
+  failedAttempt.memory.summary = "uncommitted summary";
+  failedAttempt.history.push({ role: "user", content: "failed input" });
+  store.releaseSession("retry");
+  assert.throws(() => store.getSession("retry"), /Acquire the session before reading/);
+  assert.equal(store.acquireSession("retry", 2), "stale");
+
+  assert.equal(store.acquireSession("retry", 1), "acquired");
+  const retry = store.getSession("retry", "auto");
+  assert.notStrictEqual(retry, initial);
+  assert.equal(retry.mode, "auto");
+  assert.equal(retry.turn, 0);
+  assert.deepEqual(retry.history, []);
+  assert.deepEqual(retry.memory, initial.memory);
+  assert.deepEqual(retry.gate, initial.gate);
+  const committed = commitAcquiredTurn(store, "retry");
+  store.releaseSession("retry");
+  assert.equal(store.acquireSession("retry", 2), "acquired");
+  assert.strictEqual(store.getSession("retry"), committed);
+  assert.equal(committed.mode, "auto");
+  assert.equal(committed.turn, 1);
+  assert.equal(committed.history.length, 2);
+});
+
+for (const materialize of [false, true]) {
+  test(`failed ${materialize ? "materialized first turns" : "unused reservations"} preserve a full cache and its LRU order`, () => {
+    const { store, setTime } = fixture({ maxSessions: 2 });
+    const oldest = completeTurn(store, "oldest", "fixed");
+    setTime(10);
+    const recent = completeTurn(store, "recent");
+    const beforeFailure = [structuredClone(oldest), structuredClone(recent)];
+    for (let attempt = 0; attempt < 12; attempt += 1) {
+      setTime(20 + attempt);
+      const id = `failed-${attempt}`;
+      assert.equal(store.acquireSession(id, 1), "acquired");
+      if (materialize) {
+        const failed = structuredClone(store.getSession(id, "fixed"));
+        failed.turn += 1;
+        failed.history.push({ role: "user", content: "uncommitted input" });
+      }
+      store.releaseSession(id);
+      assert.throws(() => store.getSession(id), /Acquire the session before reading/);
+      // Wrong-turn probes prove both retained entries still exist without
+      // touching their LRU positions as a successful acquisition would.
+      assert.equal(store.acquireSession("oldest", 1), "stale");
+      assert.equal(store.acquireSession("recent", 1), "stale");
+    }
+    assert.deepEqual([oldest, recent], beforeFailure);
+
+    const replacement = completeTurn(store, "replacement");
+    assert.equal(store.acquireSession("oldest", 2), "stale");
+    assert.equal(store.acquireSession("recent", 2), "acquired");
+    assert.strictEqual(store.getSession("recent"), recent);
+    assert.equal(store.acquireSession("replacement", 2), "acquired");
+    assert.strictEqual(store.getSession("replacement"), replacement);
+  });
+}
+
+test("a new successful turn evicts the oldest idle session at commit, not acquisition or first read", () => {
+  const { store } = fixture({ maxSessions: 2 });
+  completeTurn(store, "oldest");
+  const recent = completeTurn(store, "recent");
+  assert.equal(store.acquireSession("new", 1), "acquired");
+  for (const id of ["oldest", "recent"]) assert.equal(store.acquireSession(id, 1), "stale");
+  const provisional = store.getSession("new");
+  assert.equal(provisional.turn, 0);
+  for (const id of ["oldest", "recent"]) assert.equal(store.acquireSession(id, 1), "stale");
+
+  const committed = commitAcquiredTurn(store, "new");
+  assert.equal(store.acquireSession("oldest", 2), "stale");
+  assert.equal(store.acquireSession("new", 2), "busy");
+  assert.strictEqual(store.getSession("new"), committed);
+  assert.equal(store.acquireSession("recent", 2), "acquired");
+  assert.strictEqual(store.getSession("recent"), recent);
+});
+
+test("overlapping provisional commits stay bounded and preserve every active retained session", () => {
+  const { store } = fixture({ maxSessions: 3 });
+  const active = completeTurn(store, "active", "fixed");
+  completeTurn(store, "idle-a");
+  completeTurn(store, "idle-b");
+  assert.strictEqual(acquire(store, "active", "fixed"), active);
+  const first = acquire(store, "first");
+  acquire(store, "second");
+  assert.equal(store.acquireSession("overflow"), "full");
+
+  const secondCommitted = commitAcquiredTurn(store, "second");
+  assert.equal(store.acquireSession("idle-a", 2), "stale");
+  assert.equal(store.acquireSession("idle-b", 1), "stale");
+  assert.strictEqual(store.getSession("active"), active);
+  assert.strictEqual(store.getSession("first"), first);
+  store.releaseSession("second");
+  acquire(store, "third");
+  assert.equal(store.acquireSession("overflow"), "full");
+
+  const firstCommitted = commitAcquiredTurn(store, "first");
+  assert.equal(store.acquireSession("idle-b", 2), "stale");
+  assert.equal(store.acquireSession("second", 1), "stale");
+  assert.strictEqual(store.getSession("active"), active);
+  assert.strictEqual(store.getSession("first"), firstCommitted);
+  const thirdCommitted = commitAcquiredTurn(store, "third");
+  // first has committed but is still locked; only second is eligible to evict.
+  assert.equal(store.acquireSession("second", secondCommitted.turn + 1), "stale");
+  assert.strictEqual(store.getSession("active"), active);
+  assert.strictEqual(store.getSession("first"), firstCommitted);
+  assert.strictEqual(store.getSession("third"), thirdCommitted);
+  assert.equal(store.acquireSession("overflow"), "full");
+
+  for (const id of ["active", "first", "third"]) store.releaseSession(id);
+  for (const id of ["idle-a", "idle-b", "second"]) assert.equal(store.acquireSession(id, 2), "stale");
+  assert.strictEqual(acquire(store, "active", "fixed"), active);
+  assert.strictEqual(acquire(store, "first"), firstCommitted);
+  assert.strictEqual(acquire(store, "third"), thirdCommitted);
+});
+
+test("a full retained cache admits exactly the separate active cap of new reservations", () => {
+  const { store } = fixture({ maxSessions: 3 });
+  const retained = Array.from({ length: 3 }, (_, index) => completeTurn(store, `retained-${index}`));
+  for (let index = 0; index < 3; index += 1) {
+    assert.equal(store.acquireSession(`new-${index}`, 1), "acquired");
+    if (index !== 1) store.getSession(`new-${index}`);
+  }
+  assert.equal(store.acquireSession("overflow", 1), "full");
+  assert.equal(store.acquireSession("retained-0", 2), "full");
+  assert.equal(store.acquireSession("unknown-continuation", 2), "stale");
+  for (let index = 0; index < 3; index += 1) store.releaseSession(`new-${index}`);
+  for (let index = 0; index < 3; index += 1) {
+    assert.strictEqual(acquire(store, `retained-${index}`), retained[index]);
+  }
+  assert.equal(store.acquireSession("overflow", 1), "full");
 });
 
 test("the default capacity is 100 and the default idle TTL is 30 minutes", () => {
@@ -320,6 +466,7 @@ test("stale requests do not refresh LRU order but legitimate first turns may evi
   assert.equal(store.acquireSession("oldest", 1), "stale");
   assert.equal(store.acquireSession("new", 1), "acquired");
   assert.equal(store.getSession("new").turn, 0);
+  commitAcquiredTurn(store, "new");
   store.releaseSession("new");
   assert.equal(store.acquireSession("oldest", 2), "stale");
   assert.equal(store.acquireSession("recent", 2), "acquired");

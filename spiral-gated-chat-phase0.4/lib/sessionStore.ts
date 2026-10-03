@@ -26,6 +26,7 @@ export function createSessionStore({
 }: { maxSessions?: number; idleTtlMs?: number; now?: () => number } = {}) {
   const sessions = new Map<string, { session: Session; lastUsedAt: number }>();
   const inFlight = new Set<string>();
+  const provisional = new Map<string, Session>();
 
   function touch(id: string) {
     const entry = sessions.get(id);
@@ -49,14 +50,9 @@ export function createSessionStore({
     // evicting another conversation. The lock below makes this check atomic.
     const nextTurn = (sessions.get(id)?.session.turn ?? 0) + 1;
     if (expectedTurn !== undefined && expectedTurn !== nextTurn) return "stale";
-    // Include reservations not materialized by getSession yet, so the cap also
-    // holds between acquiring a slot and creating its session.
-    const reserved = [...inFlight].filter((key) => !sessions.has(key)).length;
-    if (!sessions.has(id) && sessions.size + reserved >= maxSessions) {
-      const oldestIdle = [...sessions.keys()].find((key) => !inFlight.has(key));
-      if (oldestIdle === undefined) return "full";
-      sessions.delete(oldestIdle);
-    }
+    // Bound active working turns separately from the retained-session cache.
+    // A new turn stays provisional and cannot evict anything until it commits.
+    if (inFlight.size >= maxSessions) return "full";
     inFlight.add(id);
     touch(id);
     return "acquired";
@@ -64,28 +60,36 @@ export function createSessionStore({
 
   function getSession(id: string, mode: "auto" | "fixed" = "auto"): Session {
     if (!inFlight.has(id)) throw new Error("Acquire the session before reading it");
-    let entry = sessions.get(id);
-    if (!entry) {
-      entry = {
-        session: {
-          id, mode, gate: createInitialGateState(),
-          memory: { summary: "", summary_updated_turn: -1, attn_log: [], fragments: [] },
-          history: [], turn: 0,
-        },
-        lastUsedAt: now(),
+    const entry = sessions.get(id);
+    if (entry) return entry.session;
+    let session = provisional.get(id);
+    if (!session) {
+      session = {
+        id, mode, gate: createInitialGateState(),
+        memory: { summary: "", summary_updated_turn: -1, attn_log: [], fragments: [] },
+        history: [], turn: 0,
       };
-      sessions.set(id, entry);
+      provisional.set(id, session);
     }
-    return entry.session;
+    return session;
   }
 
   function commitSession(session: Session): void {
     if (!inFlight.has(session.id)) throw new Error("Acquire the session before committing it");
+    if (!sessions.has(session.id) && sessions.size >= maxSessions) {
+      const oldestIdle = [...sessions.keys()].find((id) => !inFlight.has(id));
+      // A new in-flight turn occupies a slot, so at most maxSessions-1 retained
+      // sessions can be locked. A full cache must therefore have an idle entry.
+      if (oldestIdle === undefined) throw new Error("No idle session available for commit");
+      sessions.delete(oldestIdle);
+    }
     sessions.set(session.id, { session, lastUsedAt: now() });
+    provisional.delete(session.id);
     touch(session.id);
   }
 
   function releaseSession(id: string): void {
+    provisional.delete(id); // Failed first turns leave neither state nor a pinned mode.
     touch(id); // A long-running call starts its idle period when it finishes.
     inFlight.delete(id);
     pruneExpired();

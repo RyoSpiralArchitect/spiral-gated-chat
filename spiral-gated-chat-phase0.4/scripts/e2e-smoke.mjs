@@ -286,18 +286,51 @@ async function mainSuite() {
   assert.deepEqual(failureLog.map(({ turn, status }) => ({ turn, status })), [{ turn: 1, status: "ok" }, { turn: 2, status: "error" }, { turn: 2, status: "ok" }]);
   assert.equal(failureLog[1].assistantText, "");
   assert.equal(failureLog[1].accounting.failed_calls, 1);
+  assert.equal(failureLog[1].state_source, "heuristic_probe_fields", "Main failure must preserve the state source already derived from Probe");
+
+  await post({ sessionId: "first-turn-rollback", userText: "[mock:fail] uncommitted first turn", mode: "auto", expectedTurn: 1 }, 500);
+  const firstTurnRetry = await step("first-turn-rollback", "hello", "fixed", { expectedTurn: 1 });
+  assert.equal(firstTurnRetry.turn, 1, "a failed first turn must not commit a turn or pin its mode");
+  assert.deepEqual(firstTurnRetry.debug.memory.context_used, [{ role: "user", content: "hello" }]);
+  assert.equal(firstTurnRetry.debug.summary_used, null);
+  assert.equal(firstTurnRetry.debug.viewpoint.previous_dim, null);
+  const cleanFixedFirst = await step("first-turn-rollback-control", "hello", "fixed", { expectedTurn: 1 });
+  assert.deepEqual(comparable(firstTurnRetry), comparable(cleanFixedFirst), "retry in a different mode must start with clean gate, memory, and history");
+  const firstTurnLog = await entries("first-turn-rollback");
+  assert.deepEqual(firstTurnLog.map(({ turn, mode, status, state_source }) => ({ turn, mode, status, state_source })), [
+    { turn: 1, mode: "auto", status: "error", state_source: "heuristic_probe_fields" },
+    { turn: 1, mode: "fixed", status: "ok", state_source: "heuristic_probe_fields" },
+  ]);
   const index = await sessionIndex();
   assert.equal(index.filter((entry) => entry.sessionId === "rollback").length, 1);
   assert.equal(index.filter((entry) => entry.sessionId === "pair-auto").length, 1);
   assert.ok(index.every((entry) => path.basename(entry.log_path) === `${entry.safe_session_id}.jsonl`));
   assert.equal(index.find((entry) => entry.sessionId === "pair-auto").log_path, auto[0].debug.log.path);
-  results.push("Main failure recorded + unknown usage + atomic rollback + retry uses same turn number");
+  results.push("Main failure keeps derived state source + atomic rollback + same-turn retry + failed first turn does not pin mode");
   const repeatPreset = scenarios.find((scenario) => scenario.id === "repeated-perspective");
   assert.equal(repeatPreset.turns.length, 10);
   const presetTurns = [];
   for (const text of repeatPreset.turns) presetTurns.push(await step("actual-repeat-preset", text));
   assert.ok(presetTurns.some((turn) => turn.debug.pulse.triggered && turn.debug.viewpoint.pulse_changed), "actual repeated-perspective UI preset must demonstrate a changed pulse in mock mode");
   results.push("actual 10-turn UI repeated-perspective preset demonstrates a changed pulse");
+  await stopServer();
+}
+
+async function probeFailureSuite() {
+  await startServer("probe");
+  const sessionId = "probe-failure";
+  const failure = (await post({ sessionId, userText: "[mock:fail] no derived state", mode: "auto", expectedTurn: 1 }, 500)).body;
+  assertAccounting(failure.accounting, failure.calls);
+  assert.deepEqual(failure.calls.map((call) => [call.purpose, call.status]), [["probe", "error"]]);
+  const failureLog = await entries(sessionId);
+  assert.equal(failureLog.length, 1);
+  assert.equal(failureLog[0].status, "error");
+  assert.equal(failureLog[0].turn, 1);
+  assert.equal(failureLog[0].state_source, "previous_state", "Probe failure must retain the fallback because state derivation never completed");
+  const retry = await step(sessionId, "hello", "auto", { expectedTurn: 1 });
+  assert.equal(retry.turn, 1);
+  assert.deepEqual(retry.debug.memory.context_used, [{ role: "user", content: "hello" }]);
+  results.push("Probe failure keeps previous_state + no Main call + same-turn clean retry");
   await stopServer();
 }
 
@@ -331,6 +364,7 @@ async function optionalFailureSuite(purpose) {
 
 try {
   await mainSuite();
+  await probeFailureSuite();
   await optionalFailureSuite("summary");
   await optionalFailureSuite("explore");
   console.log(JSON.stringify({ ok: true, provider: "mock", requests, checks: results, ...(process.env.KEEP_E2E_LOGS === "1" ? { logDir } : {}) }, null, 2));
