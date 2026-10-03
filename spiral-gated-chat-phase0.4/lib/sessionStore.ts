@@ -11,35 +11,84 @@ export type Session = {
   mode: "auto" | "fixed";
   gate: GateState;
   memory: MemoryState;
-  history: StoredMessage[]; // for context building
+  history: StoredMessage[];
   turn: number;
 };
 
-const sessions = new Map<string, Session>();
+const MAX_SESSIONS = 100;
+const IDLE_TTL_MS = 30 * 60 * 1000;
 
-export function getSession(sessionId: string, mode: "auto" | "fixed" = "auto"): Session {
-  let s = sessions.get(sessionId);
-  if (!s) {
-    s = {
-      id: sessionId,
-      mode,
-      gate: createInitialGateState(),
-      memory: { summary: "", summary_updated_turn: -1, attn_log: [], fragments: [] },
-      history: [],
-      turn: 0,
-    };
-    sessions.set(sessionId, s);
+/** Process-local LRU storage. Cleanup is lazy: no background timer is needed. */
+export function createSessionStore({
+  maxSessions = MAX_SESSIONS,
+  idleTtlMs = IDLE_TTL_MS,
+  now = Date.now,
+}: { maxSessions?: number; idleTtlMs?: number; now?: () => number } = {}) {
+  const sessions = new Map<string, { session: Session; lastUsedAt: number }>();
+  const inFlight = new Set<string>();
+
+  function touch(id: string) {
+    const entry = sessions.get(id);
+    if (!entry) return;
+    entry.lastUsedAt = now();
+    sessions.delete(id);
+    sessions.set(id, entry); // insertion order is least-recently-used first
   }
-  return s;
+
+  function pruneExpired() {
+    const cutoff = now() - idleTtlMs;
+    for (const [id, entry] of sessions) {
+      if (!inFlight.has(id) && entry.lastUsedAt <= cutoff) sessions.delete(id);
+    }
+  }
+
+  function acquireSession(id: string): "acquired" | "busy" | "full" {
+    pruneExpired();
+    if (inFlight.has(id)) return "busy";
+    // Include reservations not materialized by getSession yet, so the cap also
+    // holds between acquiring a slot and creating its session.
+    const reserved = [...inFlight].filter((key) => !sessions.has(key)).length;
+    if (!sessions.has(id) && sessions.size + reserved >= maxSessions) {
+      const oldestIdle = [...sessions.keys()].find((key) => !inFlight.has(key));
+      if (oldestIdle === undefined) return "full";
+      sessions.delete(oldestIdle);
+    }
+    inFlight.add(id);
+    touch(id);
+    return "acquired";
+  }
+
+  function getSession(id: string, mode: "auto" | "fixed" = "auto"): Session {
+    if (!inFlight.has(id)) throw new Error("Acquire the session before reading it");
+    let entry = sessions.get(id);
+    if (!entry) {
+      entry = {
+        session: {
+          id, mode, gate: createInitialGateState(),
+          memory: { summary: "", summary_updated_turn: -1, attn_log: [], fragments: [] },
+          history: [], turn: 0,
+        },
+        lastUsedAt: now(),
+      };
+      sessions.set(id, entry);
+    }
+    return entry.session;
+  }
+
+  function commitSession(session: Session): void {
+    if (!inFlight.has(session.id)) throw new Error("Acquire the session before committing it");
+    sessions.set(session.id, { session, lastUsedAt: now() });
+    touch(session.id);
+  }
+
+  function releaseSession(id: string): void {
+    touch(id); // A long-running call starts its idle period when it finishes.
+    inFlight.delete(id);
+    pruneExpired();
+  }
+
+  return { acquireSession, getSession, commitSession, releaseSession };
 }
 
-// A turn works on a snapshot and commits only after Main succeeds. Concurrent
-// requests for the same session fail fast rather than mixing histories.
-const inFlight = new Set<string>();
-export function acquireSession(sessionId: string): boolean {
-  if (inFlight.has(sessionId)) return false;
-  inFlight.add(sessionId);
-  return true;
-}
-export function releaseSession(sessionId: string): void { inFlight.delete(sessionId); }
-export function commitSession(session: Session): void { sessions.set(session.id, session); }
+// Turns still work on snapshots and commit only after required phases succeed.
+export const { acquireSession, getSession, commitSession, releaseSession } = createSessionStore();

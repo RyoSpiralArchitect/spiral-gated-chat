@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  # Keep all PR bases eligible, including stacked feature branches.
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  mock-checks:
+    name: Typecheck, mock tests, and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: spiral-gated-chat-phase0.4
+    env:
+      NEXT_TELEMETRY_DISABLED: "1"
+      SPIRAL_CHAT_PROVIDER: mock
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: spiral-gated-chat-phase0.4/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Unit tests
+        run: npm run test:unit
+
+      # E2E forces mock internally and starts/stops its own local Next server.
+      # Run build afterward because both commands use the same .next directory.
+      - name: Mock API regression tests
+        run: npm run test:e2e
+
+      - name: Production build
+        run: npm run build

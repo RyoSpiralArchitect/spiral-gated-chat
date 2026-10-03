@@ -280,7 +280,10 @@ export async function POST(req: Request) {
     const parsed = stepSchema.safeParse(json);
     if (!parsed.success) return Response.json({ error: "Invalid sessionId, userText, or comparison settings" }, { status: 400 });
     const { sessionId, userText, mode, comparisonId, scenarioId, expectedTurn } = parsed.data;
-    if (!acquireSession(sessionId)) return Response.json({ error: "This session already has a turn in progress" }, { status: 409 });
+    const acquisition = acquireSession(sessionId);
+    if (acquisition !== "acquired") return Response.json({
+      error: acquisition === "busy" ? "This session already has a turn in progress" : "All session slots are busy; try again shortly",
+    }, { status: acquisition === "busy" ? 409 : 503 });
     lockedSessionId = sessionId;
     const stored = getSession(sessionId, mode);
     if (stored.mode !== mode) return Response.json({ error: "Start a new session to change mode" }, { status: 409 });

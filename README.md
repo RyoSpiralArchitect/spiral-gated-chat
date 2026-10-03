@@ -90,6 +90,8 @@ Mock の tokens は文字数からの概算で、実際の tokenizer 使用量�
 - 同じ session の同時実行や途中での mode 変更は409で拒否します。`expectedTurn` が現在の次ターンと違う要求も、provider 呼び出し前に409で拒否します
 - 空入力、型違い、不正ID、12,000文字を超える入力などは400で拒否します
 
+session は最大100件まで保持し、上限に達すると最も古く使われた待機中の session を削除します。30分以上使われていない session も、次の取得・解放時にメモリから削除します。JSONL ログは残します。実行中のターンは削除せず、全枠が実行中なら新しい session の要求を503で返します。削除後の会話は復元せず、画面の「新しい会話」や新しい比較で始め直してください。
+
 **session はサーバープロセス内のメモリにのみ保持します。** サーバーの再起動や開発時の reload で失われ、JSONL からの復元機能はありません。画面の履歴も永続的な保存・復元機能ではありません。複数 server process 間の session 共有や永続ロックもありません。ローカル実験用途です。
 
 ログには入力、返答、記憶の断片が平文で入ります。秘密情報を入力しないでください。ログ保存に失敗した場合は debug に失敗を表示します。
@@ -107,10 +109,12 @@ npm run build
 npm test
 ```
 
-- Unit: 全5フェーズの集計、失敗・不明・部分 usage、明示的な0、Mock 概算、異常値
+- Unit: 全5フェーズの集計、失敗・不明・部分 usage、明示的な0、Mock 概算、異常値。加えて session の件数上限・期限・LRU・実行中の保護を検証
 - E2E: Mock のみで独自の Next dev server を起動。3種類の故障設定を順番に検証します。live API への切替はありません
 - E2E: config / validation、10ターンの停滞と視点変更、実際のUI台本、Fixed の一定設定、summary 更新、独立 session と再実行、過去 snapshot、並行要求、重複要求、失敗・再試行の rollback、JSONL v2 を確認します
 - `E2E_PORT=3101 npm run test:e2e` でポートを変更できます。`KEEP_E2E_LOGS=1` なら一時ログを残し、最後に保存先を出力します
 - 同じ checkout の `.next` を共有するため、build / dev / E2E は同時に実行しないでください
+
+GitHub Actions は全 PR と main への push で、Node.js 22 の単一 Ubuntu runner 上で install → typecheck → unit → Mock API E2E → build を順に実行します。API キーや外部モデル呼び出しは不要です。
 
 Mock 専用のテストフックとして `SPIRAL_MOCK_DELAY_MS`（0–1000 ms）と `SPIRAL_MOCK_FAIL_PURPOSE`（`main` / `summary` / `explore` など）があります。後者は対象リクエストに `[mock:fail]` が含まれる場合だけ故障させます。実 provider には適用しません。
